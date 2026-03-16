@@ -38,6 +38,6 @@ func defaultConfig() *config {
 		pubSubChannel: "multicache:sync",
 		l1MaxItems:    10000,
 		l1MaxMemoryMB: 100,
-		prefix:        "cache:",
+		prefix:        "go:multicache:",
 	}
 }
