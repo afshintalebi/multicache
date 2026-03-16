@@ -25,6 +25,8 @@ type config struct {
 	prefix            string
 	earlyRefreshRatio float64 // e.g., 0.8 means refresh when 80% of TTL is passed
 	enableCompression bool
+	enableMetrics     bool
+	metricsPrefix     string
 }
 
 type Option func(*config)
@@ -46,14 +48,26 @@ func WithCompression(enable bool) Option {
 		c.enableCompression = enable
 	}
 }
+func WithMetrics(enable bool, prefix string) Option {
+	return func(c *config) {
+		c.enableMetrics = enable
+		if prefix == "" {
+			c.metricsPrefix = "go:multicache:metrics:"
+		} else {
+			c.metricsPrefix = prefix
+		}
+	}
+}
 
 func defaultConfig() *config {
 	return &config{
-		pubSubChannel:     "multicache:sync",
+		pubSubChannel:     "go:multicache:sync",
 		l1MaxItems:        10000,
 		l1MaxMemoryMB:     100,
 		prefix:            "go:multicache:",
 		earlyRefreshRatio: 0.8,   // Default: Refresh when 80% of TTL is reached
 		enableCompression: false, // Default: false (prioritize CPU speed over RAM)
+		enableMetrics:     false, // Default: false (Opt-in)
+		metricsPrefix:     "go:multicache:metrics:",
 	}
 }
