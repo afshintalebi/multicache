@@ -18,11 +18,12 @@ type MultiCache interface {
 }
 
 type config struct {
-	redisClient   *redis.Client
-	pubSubChannel string
-	l1MaxItems    int
-	l1MaxMemoryMB uint64
-	prefix        string
+	redisClient       *redis.Client
+	pubSubChannel     string
+	l1MaxItems        int
+	l1MaxMemoryMB     uint64
+	prefix            string
+	earlyRefreshRatio float64 // e.g., 0.8 means refresh when 80% of TTL is passed
 }
 
 type Option func(*config)
@@ -32,12 +33,20 @@ func WithPubSubChannel(channel string) Option { return func(c *config) { c.pubSu
 func WithL1MaxItems(maxItems int) Option      { return func(c *config) { c.l1MaxItems = maxItems } }
 func WithL1MaxMemoryMB(mb uint64) Option      { return func(c *config) { c.l1MaxMemoryMB = mb } }
 func WithKeyPrefix(prefix string) Option      { return func(c *config) { c.prefix = prefix } }
+func WithEarlyRefreshRatio(ratio float64) Option {
+	return func(c *config) {
+		if ratio > 0 && ratio < 1.0 {
+			c.earlyRefreshRatio = ratio
+		}
+	}
+}
 
 func defaultConfig() *config {
 	return &config{
-		pubSubChannel: "multicache:sync",
-		l1MaxItems:    10000,
-		l1MaxMemoryMB: 100,
-		prefix:        "go:multicache:",
+		pubSubChannel:     "multicache:sync",
+		l1MaxItems:        10000,
+		l1MaxMemoryMB:     100,
+		prefix:            "go:multicache:",
+		earlyRefreshRatio: 0.8, // Default: Refresh when 80% of TTL is reached
 	}
 }
