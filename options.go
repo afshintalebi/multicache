@@ -24,6 +24,7 @@ type config struct {
 	l1MaxMemoryMB     uint64
 	prefix            string
 	earlyRefreshRatio float64 // e.g., 0.8 means refresh when 80% of TTL is passed
+	enableCompression bool
 }
 
 type Option func(*config)
@@ -40,6 +41,11 @@ func WithEarlyRefreshRatio(ratio float64) Option {
 		}
 	}
 }
+func WithCompression(enable bool) Option {
+	return func(c *config) {
+		c.enableCompression = enable
+	}
+}
 
 func defaultConfig() *config {
 	return &config{
@@ -47,6 +53,7 @@ func defaultConfig() *config {
 		l1MaxItems:        10000,
 		l1MaxMemoryMB:     100,
 		prefix:            "go:multicache:",
-		earlyRefreshRatio: 0.8, // Default: Refresh when 80% of TTL is reached
+		earlyRefreshRatio: 0.8,   // Default: Refresh when 80% of TTL is reached
+		enableCompression: false, // Default: false (prioritize CPU speed over RAM)
 	}
 }

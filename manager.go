@@ -2,20 +2,18 @@ package multicache
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
 	"time"
 
+	"github.com/golang/snappy"
 	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
 )
 
-// cacheWrapper wraps the user's data with a logical expiration time.
-type cacheWrapper struct {
-	StaleAfter int64           `json:"stale_after"` // Unix timestamp for logical expiration
-	Data       json.RawMessage `json:"data"`        // json.RawMessage avoids double unmarshaling
-}
+const binaryHeaderSize = 9 // 8 bytes for int64 + 1 byte for flag
 
 type manager struct {
 	cfg      *config
@@ -74,61 +72,66 @@ func (m *manager) startPubSubListener() {
 // GetOrLoad attempts to fetch the key from L1, then L2.
 // It uses Singleflight to prevent cache stampedes and Early Expiration for zero-latency refreshes.
 func (m *manager) GetOrLoad(ctx context.Context, key string, ttl time.Duration, dest interface{}, fetchFunc FetchFunc) error {
-	var wrappedBytes []byte
-	
-	// ==========================================
-	// 1. FAST PATH: Check L1 (In-Memory)
-	// ==========================================
+	var rawBytes []byte
+
+	// 1. FAST PATH: Check L1
 	if data, found := m.l1.Get(key); found {
-		wrappedBytes = data
+		rawBytes = data
 	} else {
-		// ==========================================
-		// 2. L1 MISS: Use Singleflight for L2 & DB
-		// Prevent multiple identical requests going to Redis/DB simultaneously
-		// ==========================================
+		// 2. L1 MISS: Singleflight for L2 & DB
 		sfKey := "sf:" + key
 		result, err, _ := m.reqGroup.Do(sfKey, func() (interface{}, error) {
 			redisKey := m.cfg.prefix + key
 
-			// Check L2 (Redis)
+			// Check L2
 			l2Data, err := m.cfg.redisClient.Get(ctx, redisKey).Bytes()
 			if err == nil {
-				// Found in L2! Backfill L1 and return the wrapped bytes
 				m.l1.Set(key, l2Data, ttl)
 				return l2Data, nil
-			} else if err != redis.Nil {
-				// Log Redis errors in production, but proceed to fallback
-				log.Printf("multicache: L2 read error for %s: %v", key, err)
 			}
 
-			// Full Cache Miss (Not in L1, Not in L2): Fallback to Database
+			// DB Fallback
 			return m.fetchAndStore(ctx, key, ttl, fetchFunc)
 		})
 
 		if err != nil {
 			return err
 		}
-		
-		wrappedBytes = result.([]byte)
+		rawBytes = result.([]byte)
 	}
 
 	// ==========================================
-	// 3. PROCESS DATA & EARLY EXPIRATION
+	// 3. DECODE BINARY FORMAT & DECOMPRESS
 	// ==========================================
-	var wrapper cacheWrapper
-	if err := json.Unmarshal(wrappedBytes, &wrapper); err != nil {
-		return fmt.Errorf("multicache: failed to unmarshal wrapper: %w", err)
+	if len(rawBytes) < binaryHeaderSize {
+		return fmt.Errorf("multicache: invalid cache data corruption")
 	}
 
-	// Check if data is stale (Logical TTL has passed)
-	// Note: If data was just fetched freshly from DB, this will safely be false.
-	if time.Now().Unix() > wrapper.StaleAfter {
-		// Trigger Background Refresh without blocking the user!
+	// Extract Header Info
+	staleAfter := int64(binary.LittleEndian.Uint64(rawBytes[0:8]))
+	isCompressed := rawBytes[8] == 1
+	payload := rawBytes[binaryHeaderSize:]
+
+	// Trigger Background Refresh if stale
+	if time.Now().Unix() > staleAfter {
 		go m.backgroundRefresh(key, ttl, fetchFunc)
 	}
 
-	// Unmarshal the actual user data into the destination pointer (Zero-Latency Return)
-	return json.Unmarshal(wrapper.Data, dest)
+	// Decompress if needed
+	var finalJSON []byte
+	if isCompressed {
+		// snappy.Decode decompresses the data quickly
+		decompressed, err := snappy.Decode(nil, payload)
+		if err != nil {
+			return fmt.Errorf("multicache: failed to decompress data: %w", err)
+		}
+		finalJSON = decompressed
+	} else {
+		finalJSON = payload
+	}
+
+	// Unmarshal to user struct
+	return json.Unmarshal(finalJSON, dest)
 }
 
 // backgroundRefresh runs in a separate goroutine to update stale data.
@@ -137,7 +140,7 @@ func (m *manager) backgroundRefresh(key string, ttl time.Duration, fetchFunc Fet
 
 	// Prevent multiple background refreshes for the same key at the same time
 	m.bgGroup.Do(bgKey, func() (interface{}, error) {
-		
+
 		// CRITICAL: We cannot use the user's `ctx` here.
 		// If the user's HTTP request finishes, their `ctx` gets canceled.
 		// We create a new detached context with a timeout for the background task.
@@ -162,39 +165,56 @@ func (m *manager) backgroundRefresh(key string, ttl time.Duration, fetchFunc Fet
 
 // fetchAndStore calls the DB, wraps the data, stores in L1/L2, and returns the wrapped bytes.
 func (m *manager) fetchAndStore(ctx context.Context, key string, ttl time.Duration, fetchFunc FetchFunc) ([]byte, error) {
-	// 1. Fetch from Database
+	// 1. Fetch DB
 	dbData, err := fetchFunc(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("fetchFunc failed: %w", err)
 	}
 
-	// 2. Marshal user data
-	userBytes, err := json.Marshal(dbData)
+	// 2. Marshal to JSON
+	userJSON, err := json.Marshal(dbData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal db data: %w", err)
 	}
 
-	// 3. Calculate Stale Time (Logical TTL)
+	// ==========================================
+	// 3. COMPRESS DATA (If enabled)
+	// ==========================================
+	payload := userJSON
+	isCompressed := false
+
+	if m.cfg.enableCompression {
+		// snappy.Encode creates a compressed copy of the JSON
+		payload = snappy.Encode(nil, userJSON)
+		isCompressed = true
+	}
+
+	// 4. Calculate Logical TTL
 	staleDuration := time.Duration(float64(ttl) * m.cfg.earlyRefreshRatio)
-	staleAfter := time.Now().Add(staleDuration).Unix()
+	staleAfter := uint64(time.Now().Add(staleDuration).Unix())
 
-	// 4. Create Wrapper and Marshal
-	wrapper := cacheWrapper{
-		StaleAfter: staleAfter,
-		Data:       userBytes, // json.RawMessage handles this without escaping quotes
-	}
-	finalBytes, err := json.Marshal(wrapper)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal wrapper: %w", err)
+	// ==========================================
+	// 5. BUILD CUSTOM BINARY WRAPPER
+	// ==========================================
+	// Allocate exact bytes needed: 9 + len(payload)
+	finalBytes := make([]byte, binaryHeaderSize+len(payload))
+
+	// Write Timestamp (Bytes 0-7)
+	binary.LittleEndian.PutUint64(finalBytes[0:8], staleAfter)
+
+	// Write Compression Flag (Byte 8)
+	if isCompressed {
+		finalBytes[8] = 1
+	} else {
+		finalBytes[8] = 0
 	}
 
-	// 5. Save to L2 (Redis)
+	// Write Payload (Bytes 9+)
+	copy(finalBytes[binaryHeaderSize:], payload)
+
+	// 6. Save to Caches (Both L1 and L2 now store the highly compressed binary!)
 	redisKey := m.cfg.prefix + key
-	if err := m.cfg.redisClient.Set(ctx, redisKey, finalBytes, ttl).Err(); err != nil {
-		log.Printf("multicache: failed to save to L2 for %s: %v", key, err)
-	}
-
-	// 6. Save to L1 (Memory)
+	m.cfg.redisClient.Set(ctx, redisKey, finalBytes, ttl)
 	m.l1.Set(key, finalBytes, ttl)
 
 	return finalBytes, nil
