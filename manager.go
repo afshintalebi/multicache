@@ -12,6 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/redis/go-redis/v9"
+	"github.com/sony/gobreaker"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -31,6 +32,7 @@ type manager struct {
 	reqGroup singleflight.Group // Protection against cache stampede
 	bgGroup  singleflight.Group // Protects DB during background refresh
 	metrics  *cacheMetrics
+	cb       *gobreaker.CircuitBreaker
 }
 
 type invalidationMessage struct {
@@ -61,16 +63,34 @@ func New(opts ...Option) MultiCache {
 					Name: m.cfg.metricsPrefix + "_requests_total",
 					Help: "Total number of cache requests partitioned by layer and status",
 				},
-				[]string{"layer", "status"}, // layer: l1, l2, db | status: hit, miss, fetched
+				[]string{"layer", "status"},
 			),
 			Errors: promauto.NewCounterVec(
 				prometheus.CounterOpts{
 					Name: m.cfg.metricsPrefix + "_errors_total",
 					Help: "Total number of errors partitioned by type",
 				},
-				[]string{"type"}, // type: redis, db, internal
+				[]string{"type"},
 			),
 		}
+	}
+
+	// Initialize Circuit Breaker with dynamic configuration
+	if m.cfg.enableCircuitBreaker {
+		st := gobreaker.Settings{
+			Name:        "RedisCircuitBreaker",
+			MaxRequests: 1,               // Number of requests allowed in half-open state
+			Interval:    0,               // Never clear failure counts based on time
+			Timeout:     m.cfg.cbTimeout, // Dynamic timeout from config
+			ReadyToTrip: func(counts gobreaker.Counts) bool {
+				// Dynamic max failures from config
+				return counts.ConsecutiveFailures >= m.cfg.cbMaxFailures
+			},
+			OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
+				log.Printf("🔌 Circuit Breaker '%s' State Changed: %s -> %s", name, from.String(), to.String())
+			},
+		}
+		m.cb = gobreaker.NewCircuitBreaker(st)
 	}
 
 	m.startPubSubListener()
@@ -117,33 +137,58 @@ func (m *manager) incErr(errType string) {
 func (m *manager) GetOrLoad(ctx context.Context, key string, ttl time.Duration, dest interface{}, fetchFunc FetchFunc) error {
 	var rawBytes []byte
 
-	// ==========================================
 	// 1. FAST PATH: Check L1
-	// ==========================================
 	if data, found := m.l1.Get(key); found {
 		rawBytes = data
-		m.incReq("l1", "hit") // METRIC: L1 Hit
+		m.incReq("l1", "hit")
 	} else {
-		// ==========================================
 		// 2. L1 MISS: Singleflight for L2 & DB
-		// ==========================================
-		m.incReq("l1", "miss") // METRIC: L1 Miss
-
+		m.incReq("l1", "miss")
 		sfKey := "sf:" + key
+
 		result, err, _ := m.reqGroup.Do(sfKey, func() (interface{}, error) {
 			redisKey := m.cfg.prefix + key
+			var l2Data []byte
+			var l2Err error
 
-			// Check L2
-			l2Data, err := m.cfg.redisClient.Get(ctx, redisKey).Bytes()
-			if err == nil {
-				m.l1.Set(key, l2Data, ttl)
-				m.incReq("l2", "hit") // METRIC: L2 Hit
-				return l2Data, nil
-			} else if err != redis.Nil {
-				m.incErr("redis") // METRIC: Redis Error
-				log.Printf("multicache: L2 read error for %s: %v", key, err)
+			// Safe L2 Fetch with Circuit Breaker
+			if m.cb != nil {
+				res, cbErr := m.cb.Execute(func() (interface{}, error) {
+					bytes, rErr := m.cfg.redisClient.Get(ctx, redisKey).Bytes()
+					if rErr == redis.Nil {
+						// Cache miss is NOT a failure.
+						return nil, nil
+					}
+					if rErr != nil {
+						// Actual network/redis error. Trip the breaker!
+						return nil, rErr
+					}
+					return bytes, nil
+				})
+
+				if cbErr != nil {
+					l2Err = cbErr // Breaker is OPEN or Redis Failed
+				} else {
+					if res == nil {
+						l2Err = redis.Nil
+					} else {
+						l2Data = res.([]byte)
+						l2Err = nil
+					}
+				}
 			} else {
-				m.incReq("l2", "miss") // METRIC: L2 Miss
+				l2Data, l2Err = m.cfg.redisClient.Get(ctx, redisKey).Bytes()
+			}
+
+			if l2Err == nil {
+				m.l1.Set(key, l2Data, ttl)
+				m.incReq("l2", "hit")
+				return l2Data, nil
+			} else if l2Err != redis.Nil {
+				// Breaker Open or Redis Failed. Fallback gracefully to DB.
+				m.incErr("redis")
+			} else {
+				m.incReq("l2", "miss")
 			}
 
 			// DB Fallback
@@ -156,9 +201,7 @@ func (m *manager) GetOrLoad(ctx context.Context, key string, ttl time.Duration, 
 		rawBytes = result.([]byte)
 	}
 
-	// ==========================================
 	// 3. DECODE BINARY FORMAT & DECOMPRESS
-	// ==========================================
 	if len(rawBytes) < binaryHeaderSize {
 		m.incErr("internal_corruption")
 		return fmt.Errorf("multicache: invalid cache data corruption")
@@ -168,12 +211,12 @@ func (m *manager) GetOrLoad(ctx context.Context, key string, ttl time.Duration, 
 	isCompressed := rawBytes[8] == 1
 	payload := rawBytes[binaryHeaderSize:]
 
-	// Trigger Background Refresh if stale
+	// Trigger Background Refresh
 	if time.Now().Unix() > staleAfter {
 		go m.backgroundRefresh(key, ttl, fetchFunc)
 	}
 
-	// Decompress if needed
+	// Decompress
 	var finalJSON []byte
 	if isCompressed {
 		decompressed, err := snappy.Decode(nil, payload)
@@ -189,31 +232,29 @@ func (m *manager) GetOrLoad(ctx context.Context, key string, ttl time.Duration, 
 	return json.Unmarshal(finalJSON, dest)
 }
 
-
 // backgroundRefresh runs in a separate goroutine to update stale data.
 func (m *manager) backgroundRefresh(key string, ttl time.Duration, fetchFunc FetchFunc) {
 	bgKey := "bg:" + key
-
-	// Prevent multiple background refreshes for the same key at the same time
 	m.bgGroup.Do(bgKey, func() (interface{}, error) {
-
-		// CRITICAL: We cannot use the user's `ctx` here.
-		// If the user's HTTP request finishes, their `ctx` gets canceled.
-		// We create a new detached context with a timeout for the background task.
 		bgCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		_, err := m.fetchAndStore(bgCtx, key, ttl, fetchFunc)
 		if err != nil {
-			log.Printf("multicache: background refresh failed for key %s: %v", key, err)
 			return nil, err
 		}
 
-		// Broadcast invalidation so other instances drop their L1 stale data
-		// and load the newly refreshed L2 data on their next request.
+		// Broadcast invalidation via Circuit Breaker
 		msg := invalidationMessage{Key: key}
 		payload, _ := json.Marshal(msg)
-		m.cfg.redisClient.Publish(bgCtx, m.cfg.pubSubChannel, payload)
+
+		if m.cb != nil {
+			_, _ = m.cb.Execute(func() (interface{}, error) {
+				return nil, m.cfg.redisClient.Publish(bgCtx, m.cfg.pubSubChannel, payload).Err()
+			})
+		} else {
+			m.cfg.redisClient.Publish(bgCtx, m.cfg.pubSubChannel, payload)
+		}
 
 		return nil, nil
 	})
@@ -221,36 +262,28 @@ func (m *manager) backgroundRefresh(key string, ttl time.Duration, fetchFunc Fet
 
 // fetchAndStore calls the DB, wraps the data, stores in L1/L2.
 func (m *manager) fetchAndStore(ctx context.Context, key string, ttl time.Duration, fetchFunc FetchFunc) ([]byte, error) {
-	// 1. Fetch DB
 	dbData, err := fetchFunc(ctx)
 	if err != nil {
-		m.incErr("db") // METRIC: DB Error
+		m.incErr("db")
 		return nil, fmt.Errorf("fetchFunc failed: %w", err)
 	}
-	m.incReq("db", "fetched") // METRIC: DB Fetched (Cache Miss resolved)
+	m.incReq("db", "fetched")
 
-	// 2. Marshal to JSON
 	userJSON, err := json.Marshal(dbData)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal db data: %w", err)
 	}
 
-	// 3. Compress
 	payload := userJSON
 	isCompressed := false
-	if m.cfg.enableMetrics {
-		// Just a structural condition, actual compression is based on cfg.enableCompression
-	}
 	if m.cfg.enableCompression {
 		payload = snappy.Encode(nil, userJSON)
 		isCompressed = true
 	}
 
-	// 4. Calculate Logical TTL
 	staleDuration := time.Duration(float64(ttl) * m.cfg.earlyRefreshRatio)
 	staleAfter := uint64(time.Now().Add(staleDuration).Unix())
 
-	// 5. Build Binary Header
 	finalBytes := make([]byte, binaryHeaderSize+len(payload))
 	binary.LittleEndian.PutUint64(finalBytes[0:8], staleAfter)
 	if isCompressed {
@@ -260,31 +293,44 @@ func (m *manager) fetchAndStore(ctx context.Context, key string, ttl time.Durati
 	}
 	copy(finalBytes[binaryHeaderSize:], payload)
 
-	// 6. Save to Caches
+	// Save to L2 via Circuit Breaker
 	redisKey := m.cfg.prefix + key
-	if err := m.cfg.redisClient.Set(ctx, redisKey, finalBytes, ttl).Err(); err != nil {
-		m.incErr("redis_write") // METRIC: Redis Write Error
+	if m.cb != nil {
+		_, _ = m.cb.Execute(func() (interface{}, error) {
+			return nil, m.cfg.redisClient.Set(ctx, redisKey, finalBytes, ttl).Err()
+		})
+	} else {
+		m.cfg.redisClient.Set(ctx, redisKey, finalBytes, ttl)
 	}
-	m.l1.Set(key, finalBytes, ttl)
 
+	m.l1.Set(key, finalBytes, ttl)
 	return finalBytes, nil
 }
 
 func (m *manager) Delete(ctx context.Context, key string) error {
 	redisKey := m.cfg.prefix + key
-
-	// Remove from L2
-	m.cfg.redisClient.Del(ctx, redisKey)
-
-	// Remove from Local L1
 	m.l1.Delete(key)
 
-	// Broadcast to cluster to remove from their L1
 	msg := invalidationMessage{Key: key}
 	payload, _ := json.Marshal(msg)
-	m.cfg.redisClient.Publish(ctx, m.cfg.pubSubChannel, payload)
 
-	return nil
+	// Perform L2 delete and PubSub broadcast via Circuit Breaker
+	if m.cb != nil {
+		_, err := m.cb.Execute(func() (interface{}, error) {
+			pipe := m.cfg.redisClient.TxPipeline()
+			pipe.Del(ctx, redisKey)
+			pipe.Publish(ctx, m.cfg.pubSubChannel, payload)
+			_, pErr := pipe.Exec(ctx)
+			return nil, pErr
+		})
+		return err
+	}
+
+	pipe := m.cfg.redisClient.TxPipeline()
+	pipe.Del(ctx, redisKey)
+	pipe.Publish(ctx, m.cfg.pubSubChannel, payload)
+	_, err := pipe.Exec(ctx)
+	return err
 }
 
 func (m *manager) Close() error {

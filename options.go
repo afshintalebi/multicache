@@ -18,15 +18,18 @@ type MultiCache interface {
 }
 
 type config struct {
-	redisClient       *redis.Client
-	pubSubChannel     string
-	l1MaxItems        int
-	l1MaxMemoryMB     uint64
-	prefix            string
-	earlyRefreshRatio float64 // e.g., 0.8 means refresh when 80% of TTL is passed
-	enableCompression bool
-	enableMetrics     bool
-	metricsPrefix     string
+	redisClient          *redis.Client
+	pubSubChannel        string
+	l1MaxItems           int
+	l1MaxMemoryMB        uint64
+	prefix               string
+	earlyRefreshRatio    float64 // e.g., 0.8 means refresh when 80% of TTL is passed
+	enableCompression    bool
+	enableMetrics        bool
+	metricsPrefix        string
+	enableCircuitBreaker bool
+	cbMaxFailures        uint32
+	cbTimeout            time.Duration
 }
 
 type Option func(*config)
@@ -58,16 +61,34 @@ func WithMetrics(enable bool, prefix string) Option {
 		}
 	}
 }
+func WithCircuitBreaker(enable bool) Option {
+	return func(c *config) {
+		c.enableCircuitBreaker = enable
+	}
+}
+func WithCircuitBreakerSettings(maxFailures uint32, timeout time.Duration) Option {
+	return func(c *config) {
+		if maxFailures > 0 {
+			c.cbMaxFailures = maxFailures
+		}
+		if timeout > 0 {
+			c.cbTimeout = timeout
+		}
+	}
+}
 
 func defaultConfig() *config {
 	return &config{
-		pubSubChannel:     "go:multicache:sync",
-		l1MaxItems:        10000,
-		l1MaxMemoryMB:     100,
-		prefix:            "go:multicache:",
-		earlyRefreshRatio: 0.8,   // Default: Refresh when 80% of TTL is reached
-		enableCompression: false, // Default: false (prioritize CPU speed over RAM)
-		enableMetrics:     false, // Default: false (Opt-in)
-		metricsPrefix:     "go:multicache:metrics:",
+		pubSubChannel:        "go:multicache:sync",
+		l1MaxItems:           10000,
+		l1MaxMemoryMB:        100,
+		prefix:               "go:multicache:",
+		earlyRefreshRatio:    0.8,   // Default: Refresh when 80% of TTL is reached
+		enableCompression:    false, // Default: false (prioritize CPU speed over RAM)
+		enableMetrics:        false, // Default: false (Opt-in)
+		metricsPrefix:        "go:multicache:metrics:",
+		enableCircuitBreaker: false,
+		cbMaxFailures:        3,
+		cbTimeout:            5 * time.Second,
 	}
 }
